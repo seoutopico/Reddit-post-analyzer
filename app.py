@@ -5,6 +5,7 @@ import re
 import streamlit as st
 from datetime import datetime
 from openai import OpenAI
+import time
 
 # Configuración de la página
 st.set_page_config(
@@ -23,8 +24,6 @@ if "current_analysis" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-USER_AGENT = "PostAnalyzer/1.0"
-
 # Funciones principales
 def extract_post_id_from_url(url):
     """Extrae el ID del post de una URL de Reddit"""
@@ -40,21 +39,59 @@ def extract_post_id_from_url(url):
     return None
 
 def get_post_by_id(post_id, include_comments=True, max_comments=15):
-    """Obtiene el contenido del post de Reddit"""
-    url = f"https://www.reddit.com/comments/{post_id}.json"
-    headers = {"User-Agent": USER_AGENT}
+    """Obtiene el contenido del post de Reddit con múltiples métodos de fallback"""
     
-    try:
-        with st.spinner(f"🌐 Obteniendo post..."):
-            res = requests.get(url, headers=headers, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            
-            post_data = data[0]["data"]["children"][0]["data"]
-            subreddit = post_data.get("subreddit", "")
-            score = post_data.get("score", 0)
-            
-            post_content = f"""
+    # Lista de endpoints a intentar
+    endpoints = [
+        f"https://old.reddit.com/comments/{post_id}.json",
+        f"https://www.reddit.com/comments/{post_id}.json",
+        f"https://reddit.com/comments/{post_id}.json"
+    ]
+    
+    # Headers variados para evitar detección
+    headers_list = [
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        },
+        {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Accept": "*/*"
+        },
+        {
+            "User-Agent": "PostAnalyzer/1.0 (Educational Purpose)",
+            "Accept": "application/json"
+        }
+    ]
+    
+    last_error = None
+    
+    for endpoint in endpoints:
+        for headers in headers_list:
+            try:
+                with st.spinner(f"🌐 Intentando obtener post... ({endpoints.index(endpoint)+1}/{len(endpoints)})"):
+                    # Pequeña pausa para evitar rate limiting
+                    time.sleep(1)
+                    
+                    res = requests.get(
+                        endpoint, 
+                        headers=headers, 
+                        timeout=10,
+                        allow_redirects=True
+                    )
+                    
+                    if res.status_code == 200:
+                        data = res.json()
+                        
+                        # Procesar los datos
+                        post_data = data[0]["data"]["children"][0]["data"]
+                        subreddit = post_data.get("subreddit", "")
+                        score = post_data.get("score", 0)
+                        
+                        post_content = f"""
 TÍTULO: {post_data.get('title', '')}
 CONTENIDO: {post_data.get('selftext', 'Sin contenido adicional')}
 SCORE: {score} votos
@@ -62,42 +99,69 @@ COMENTARIOS: {post_data.get('num_comments', 0)} comentarios
 URL: https://reddit.com{post_data.get('permalink', '')}
 SUBREDDIT: r/{subreddit}
 """
-            
-            if include_comments:
-                comments_data = data[1]["data"]["children"]
-                comment_section = "\n\nCOMENTARIOS PRINCIPALES:\n"
-                comment_count = 0
-                
-                for comment in comments_data:
-                    if comment.get("kind") != "t1":
-                        continue
-                    comment_data = comment.get("data", {})
-                    comment_body = comment_data.get("body", "")
-                    comment_score = comment_data.get("score", 0)
+                        
+                        if include_comments and len(data) > 1:
+                            comments_data = data[1]["data"]["children"]
+                            comment_section = "\n\nCOMENTARIOS PRINCIPALES:\n"
+                            comment_count = 0
+                            
+                            for comment in comments_data:
+                                if comment.get("kind") != "t1":
+                                    continue
+                                comment_data = comment.get("data", {})
+                                comment_body = comment_data.get("body", "")
+                                comment_score = comment_data.get("score", 0)
+                                
+                                if comment_body and comment_body not in ["[deleted]", "[removed]"]:
+                                    comment_section += f"\n--- COMENTARIO {comment_count + 1} (Score: {comment_score}) ---\n"
+                                    comment_section += f"{comment_body}\n"
+                                    comment_count += 1
+                                
+                                if comment_count >= max_comments:
+                                    break
+                            
+                            if comment_count > 0:
+                                post_content += comment_section
+                            else:
+                                post_content += "\n\nNo hay comentarios disponibles."
+                        
+                        return {
+                            'title': post_data.get('title', ''),
+                            'content': post_content,
+                            'score': score,
+                            'url': f"https://reddit.com{post_data.get('permalink', '')}",
+                            'subreddit': subreddit
+                        }
                     
-                    if comment_body and comment_body not in ["[deleted]", "[removed]"]:
-                        comment_section += f"\n--- COMENTARIO {comment_count + 1} (Score: {comment_score}) ---\n"
-                        comment_section += f"{comment_body}\n"
-                        comment_count += 1
-                    
-                    if comment_count >= max_comments:
-                        break
-                
-                if comment_count > 0:
-                    post_content += comment_section
-                else:
-                    post_content += "\n\nNo hay comentarios disponibles."
-            
-            return {
-                'title': post_data.get('title', ''),
-                'content': post_content,
-                'score': score,
-                'url': f"https://reddit.com{post_data.get('permalink', '')}",
-                'subreddit': subreddit
-            }
-    except Exception as e:
-        st.error(f"Error obteniendo el post: {str(e)}")
-        return None
+                    elif res.status_code == 429:
+                        last_error = "Rate limit alcanzado. Espera un momento antes de intentar de nuevo."
+                        time.sleep(5)
+                    else:
+                        last_error = f"Error {res.status_code}: {res.reason}"
+                        
+            except requests.exceptions.Timeout:
+                last_error = "Tiempo de espera agotado"
+            except requests.exceptions.ConnectionError:
+                last_error = "Error de conexión"
+            except Exception as e:
+                last_error = str(e)
+    
+    # Si todos los intentos fallan
+    st.error(f"""
+    ❌ No se pudo obtener el post de Reddit.
+    
+    **Posibles razones:**
+    - Reddit está bloqueando las solicitudes desde servidores cloud
+    - El post no existe o fue eliminado
+    - Problemas de conectividad
+    
+    **Solución alternativa:**
+    1. Copia el contenido del post manualmente
+    2. Pégalo en el campo de texto alternativo abajo
+    
+    Último error: {last_error}
+    """)
+    return None
 
 def analyze_post(client, post_content, analysis_prompt=""):
     """Analiza el contenido del post usando OpenAI"""
@@ -166,6 +230,8 @@ st.title("📊 Reddit Post Analyzer - Demo")
 st.markdown("""
 Esta es una versión demo para analizar posts de Reddit usando IA.
 Necesitas tu propia API Key de OpenAI para usarla.
+
+⚠️ **Nota**: Si Reddit bloquea el acceso, puedes pegar el contenido manualmente.
 """)
 
 # Sidebar para API Key
@@ -191,6 +257,12 @@ with st.sidebar:
     3. Analiza el contenido
     4. Chatea con el análisis
     5. Descarga el resultado en TXT
+    
+    ### 🔧 Solución de problemas:
+    Si Reddit bloquea el acceso, puedes:
+    - Usar el modo manual (pegar contenido)
+    - Ejecutar la app localmente
+    - Intentar más tarde
     """)
 
 # Tabs principales
@@ -202,6 +274,8 @@ with tab1:
     if not api_key:
         st.info("👆 Primero ingresa tu API Key en la barra lateral")
     else:
+        # Opción 1: URL automática
+        st.subheader("Opción 1: Obtener automáticamente")
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -253,6 +327,39 @@ with tab1:
                     file_name=f"reddit_{st.session_state.current_post_id}_{datetime.now().strftime('%Y%m%d')}.txt",
                     mime="text/plain"
                 )
+        
+        # Opción 2: Entrada manual
+        st.markdown("---")
+        st.subheader("Opción 2: Entrada manual (si la automática falla)")
+        
+        with st.expander("📝 Pegar contenido manualmente"):
+            manual_title = st.text_input("Título del post:")
+            manual_subreddit = st.text_input("Subreddit (ej: AskReddit):")
+            manual_content = st.text_area(
+                "Contenido del post (incluye comentarios si quieres):",
+                height=300,
+                help="Copia y pega el contenido completo del post aquí"
+            )
+            
+            if st.button("🔍 Analizar contenido manual"):
+                if manual_title and manual_content:
+                    # Crear estructura de post manual
+                    post = {
+                        'title': manual_title,
+                        'content': manual_content,
+                        'score': 0,
+                        'url': 'Entrada manual',
+                        'subreddit': manual_subreddit or 'unknown'
+                    }
+                    
+                    analysis = analyze_post(client, manual_content, analysis_prompt)
+                    st.session_state.current_post = post
+                    st.session_state.current_analysis = analysis
+                    st.session_state.current_post_id = "manual_" + datetime.now().strftime('%Y%m%d%H%M%S')
+                    st.session_state.chat_history = []
+                    st.success("✅ Contenido analizado correctamente")
+                else:
+                    st.warning("Por favor, completa al menos el título y contenido")
 
 with tab2:
     st.header("Chat sobre el Post")
@@ -334,5 +441,8 @@ st.markdown("""
     <p>🔗 <a href='https://github.com/tu-usuario/reddit-analyzer'>GitHub</a> | 
     ⚡ Powered by OpenAI GPT-4 | 
     🚀 Built with Streamlit</p>
+    <p style='font-size: 0.8em; color: gray;'>
+    Si Reddit bloquea el acceso, usa la opción manual o ejecuta localmente
+    </p>
 </div>
 """, unsafe_allow_html=True)
