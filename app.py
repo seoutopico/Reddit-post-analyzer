@@ -1,11 +1,10 @@
-import os
 import requests
 import json
 import re
 import streamlit as st
 from datetime import datetime
 from openai import OpenAI
-import time
+import urllib.parse
 
 # Configuración de la página
 st.set_page_config(
@@ -24,7 +23,6 @@ if "current_analysis" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# Funciones principales
 def extract_post_id_from_url(url):
     """Extrae el ID del post de una URL de Reddit"""
     patterns = [
@@ -38,60 +36,62 @@ def extract_post_id_from_url(url):
             return match.group(1)
     return None
 
-def get_post_by_id(post_id, include_comments=True, max_comments=15):
-    """Obtiene el contenido del post de Reddit con múltiples métodos de fallback"""
+def get_post_via_proxy(post_id, include_comments=True, max_comments=15):
+    """Obtiene el post usando un proxy para evitar bloqueos"""
+    reddit_url = f"https://www.reddit.com/comments/{post_id}.json"
     
-    # Lista de endpoints a intentar
-    endpoints = [
-        f"https://old.reddit.com/comments/{post_id}.json",
-        f"https://www.reddit.com/comments/{post_id}.json",
-        f"https://reddit.com/comments/{post_id}.json"
-    ]
+    # Método 1: Usar AllOrigins (proxy gratuito)
+    proxy_url = f"https://api.allorigins.win/raw?url={urllib.parse.quote(reddit_url)}"
     
-    # Headers variados para evitar detección
-    headers_list = [
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache"
-        },
-        {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-            "Accept": "*/*"
-        },
-        {
-            "User-Agent": "PostAnalyzer/1.0 (Educational Purpose)",
-            "Accept": "application/json"
-        }
-    ]
+    try:
+        with st.spinner("🌐 Obteniendo post via proxy..."):
+            response = requests.get(proxy_url, timeout=15)
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    return process_reddit_data(data, include_comments, max_comments)
+                except json.JSONDecodeError:
+                    st.error("Error decodificando la respuesta. Intenta con otro post o usa el modo manual.")
+                    return None
+            else:
+                return None
+                
+    except Exception as e:
+        st.error(f"Error con proxy: {str(e)}")
+        return None
+
+def get_post_via_cors_proxy(post_id, include_comments=True, max_comments=15):
+    """Método alternativo usando otro proxy"""
+    reddit_url = f"https://www.reddit.com/comments/{post_id}.json"
     
-    last_error = None
+    # Método 2: Usar corsproxy.io
+    proxy_url = f"https://corsproxy.io/?{urllib.parse.quote(reddit_url)}"
     
-    for endpoint in endpoints:
-        for headers in headers_list:
-            try:
-                with st.spinner(f"🌐 Intentando obtener post... ({endpoints.index(endpoint)+1}/{len(endpoints)})"):
-                    # Pequeña pausa para evitar rate limiting
-                    time.sleep(1)
-                    
-                    res = requests.get(
-                        endpoint, 
-                        headers=headers, 
-                        timeout=10,
-                        allow_redirects=True
-                    )
-                    
-                    if res.status_code == 200:
-                        data = res.json()
-                        
-                        # Procesar los datos
-                        post_data = data[0]["data"]["children"][0]["data"]
-                        subreddit = post_data.get("subreddit", "")
-                        score = post_data.get("score", 0)
-                        
-                        post_content = f"""
+    try:
+        with st.spinner("🌐 Intentando método alternativo..."):
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            response = requests.get(proxy_url, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return process_reddit_data(data, include_comments, max_comments)
+            else:
+                return None
+                
+    except Exception:
+        return None
+
+def process_reddit_data(data, include_comments=True, max_comments=15):
+    """Procesa los datos JSON de Reddit"""
+    try:
+        post_data = data[0]["data"]["children"][0]["data"]
+        subreddit = post_data.get("subreddit", "")
+        score = post_data.get("score", 0)
+        
+        post_content = f"""
 TÍTULO: {post_data.get('title', '')}
 CONTENIDO: {post_data.get('selftext', 'Sin contenido adicional')}
 SCORE: {score} votos
@@ -99,69 +99,63 @@ COMENTARIOS: {post_data.get('num_comments', 0)} comentarios
 URL: https://reddit.com{post_data.get('permalink', '')}
 SUBREDDIT: r/{subreddit}
 """
-                        
-                        if include_comments and len(data) > 1:
-                            comments_data = data[1]["data"]["children"]
-                            comment_section = "\n\nCOMENTARIOS PRINCIPALES:\n"
-                            comment_count = 0
-                            
-                            for comment in comments_data:
-                                if comment.get("kind") != "t1":
-                                    continue
-                                comment_data = comment.get("data", {})
-                                comment_body = comment_data.get("body", "")
-                                comment_score = comment_data.get("score", 0)
-                                
-                                if comment_body and comment_body not in ["[deleted]", "[removed]"]:
-                                    comment_section += f"\n--- COMENTARIO {comment_count + 1} (Score: {comment_score}) ---\n"
-                                    comment_section += f"{comment_body}\n"
-                                    comment_count += 1
-                                
-                                if comment_count >= max_comments:
-                                    break
-                            
-                            if comment_count > 0:
-                                post_content += comment_section
-                            else:
-                                post_content += "\n\nNo hay comentarios disponibles."
-                        
-                        return {
-                            'title': post_data.get('title', ''),
-                            'content': post_content,
-                            'score': score,
-                            'url': f"https://reddit.com{post_data.get('permalink', '')}",
-                            'subreddit': subreddit
-                        }
-                    
-                    elif res.status_code == 429:
-                        last_error = "Rate limit alcanzado. Espera un momento antes de intentar de nuevo."
-                        time.sleep(5)
-                    else:
-                        last_error = f"Error {res.status_code}: {res.reason}"
-                        
-            except requests.exceptions.Timeout:
-                last_error = "Tiempo de espera agotado"
-            except requests.exceptions.ConnectionError:
-                last_error = "Error de conexión"
-            except Exception as e:
-                last_error = str(e)
+        
+        if include_comments and len(data) > 1:
+            comments_data = data[1]["data"]["children"]
+            comment_section = "\n\nCOMENTARIOS PRINCIPALES:\n"
+            comment_count = 0
+            
+            for comment in comments_data:
+                if comment.get("kind") != "t1":
+                    continue
+                comment_data = comment.get("data", {})
+                comment_body = comment_data.get("body", "")
+                comment_score = comment_data.get("score", 0)
+                
+                if comment_body and comment_body not in ["[deleted]", "[removed]"]:
+                    comment_section += f"\n--- COMENTARIO {comment_count + 1} (Score: {comment_score}) ---\n"
+                    comment_section += f"{comment_body}\n"
+                    comment_count += 1
+                
+                if comment_count >= max_comments:
+                    break
+            
+            if comment_count > 0:
+                post_content += comment_section
+            else:
+                post_content += "\n\nNo hay comentarios disponibles."
+        
+        return {
+            'title': post_data.get('title', ''),
+            'content': post_content,
+            'score': score,
+            'url': f"https://reddit.com{post_data.get('permalink', '')}",
+            'subreddit': subreddit
+        }
+    except Exception as e:
+        st.error(f"Error procesando datos: {str(e)}")
+        return None
+
+def get_post_by_id(post_id, include_comments=True, max_comments=15):
+    """Intenta obtener el post con varios métodos"""
+    # Intentar con proxy primero
+    result = get_post_via_proxy(post_id, include_comments, max_comments)
     
-    # Si todos los intentos fallan
-    st.error(f"""
-    ❌ No se pudo obtener el post de Reddit.
+    if not result:
+        # Si falla, intentar con proxy alternativo
+        result = get_post_via_cors_proxy(post_id, include_comments, max_comments)
     
-    **Posibles razones:**
-    - Reddit está bloqueando las solicitudes desde servidores cloud
-    - El post no existe o fue eliminado
-    - Problemas de conectividad
+    if not result:
+        st.error("""
+        ❌ No se pudo obtener el post automáticamente.
+        
+        **Por favor usa la opción manual abajo:**
+        1. Abre el post en Reddit
+        2. Copia el título y contenido
+        3. Pégalo en la sección "Entrada Manual"
+        """)
     
-    **Solución alternativa:**
-    1. Copia el contenido del post manualmente
-    2. Pégalo en el campo de texto alternativo abajo
-    
-    Último error: {last_error}
-    """)
-    return None
+    return result
 
 def analyze_post(client, post_content, analysis_prompt=""):
     """Analiza el contenido del post usando OpenAI"""
@@ -228,10 +222,9 @@ Score: {post_data['score']} votos
 # INTERFAZ PRINCIPAL
 st.title("📊 Reddit Post Analyzer - Demo")
 st.markdown("""
-Esta es una versión demo para analizar posts de Reddit usando IA.
-Necesitas tu propia API Key de OpenAI para usarla.
+Analiza posts de Reddit usando IA. Necesitas tu propia API Key de OpenAI.
 
-⚠️ **Nota**: Si Reddit bloquea el acceso, puedes pegar el contenido manualmente.
+🔧 **Nota**: Usamos proxies para evitar bloqueos de Reddit. Si falla, usa la entrada manual.
 """)
 
 # Sidebar para API Key
@@ -251,18 +244,15 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("""
-    ### 📖 Cómo usar:
-    1. Ingresa tu API Key de OpenAI
-    2. Pega la URL de un post de Reddit
-    3. Analiza el contenido
-    4. Chatea con el análisis
-    5. Descarga el resultado en TXT
+    ### 📖 Instrucciones:
+    1. Ingresa tu API Key
+    2. Pega URL del post
+    3. Analiza y chatea
+    4. Descarga resultados
     
-    ### 🔧 Solución de problemas:
-    Si Reddit bloquea el acceso, puedes:
-    - Usar el modo manual (pegar contenido)
-    - Ejecutar la app localmente
-    - Intentar más tarde
+    ### 🆘 Si falla la carga:
+    Usa la opción manual para
+    pegar el contenido directamente
     """)
 
 # Tabs principales
@@ -274,76 +264,80 @@ with tab1:
     if not api_key:
         st.info("👆 Primero ingresa tu API Key en la barra lateral")
     else:
-        # Opción 1: URL automática
-        st.subheader("Opción 1: Obtener automáticamente")
-        col1, col2 = st.columns([1, 1])
+        # Opción automática
+        st.subheader("🤖 Opción Automática")
         
+        url = st.text_input("URL del post de Reddit:", 
+                           placeholder="https://www.reddit.com/r/...")
+        
+        col1, col2 = st.columns(2)
         with col1:
-            url = st.text_input("URL del post de Reddit:")
             include_comments = st.checkbox("Incluir comentarios", value=True)
-            max_comments = st.slider(
-                "Número de comentarios", 
-                5, 30, 15,
-                disabled=not include_comments
-            )
-            analysis_prompt = st.text_input(
-                "Aspecto específico a analizar (opcional):"
-            )
-            
-            if st.button("🔍 Analizar Post", type="primary"):
-                if url:
-                    post_id = extract_post_id_from_url(url)
-                    if post_id:
-                        post = get_post_by_id(post_id, include_comments, max_comments)
-                        if post:
-                            analysis = analyze_post(client, post['content'], analysis_prompt)
-                            st.session_state.current_post = post
-                            st.session_state.current_analysis = analysis
-                            st.session_state.current_post_id = post_id
-                            st.session_state.chat_history = []
-                            st.success("✅ Post analizado correctamente")
-                            st.balloons()
-                    else:
-                        st.error("URL no válida")
-                else:
-                    st.warning("Por favor, ingresa una URL")
-        
         with col2:
-            if st.session_state.current_analysis:
-                st.subheader("📊 Resultado del Análisis")
-                st.info(f"**Título**: {st.session_state.current_post['title']}")
-                st.info(f"**Subreddit**: r/{st.session_state.current_post['subreddit']}")
-                st.markdown(st.session_state.current_analysis)
-                
-                # Botón de descarga
+            max_comments = st.slider("Máx. comentarios", 5, 30, 15, 
+                                    disabled=not include_comments)
+        
+        analysis_prompt = st.text_input("Aspecto a analizar (opcional):")
+        
+        if st.button("🔍 Analizar Post", type="primary", use_container_width=True):
+            if url:
+                post_id = extract_post_id_from_url(url)
+                if post_id:
+                    post = get_post_by_id(post_id, include_comments, max_comments)
+                    if post:
+                        analysis = analyze_post(client, post['content'], analysis_prompt)
+                        st.session_state.current_post = post
+                        st.session_state.current_analysis = analysis
+                        st.session_state.current_post_id = post_id
+                        st.session_state.chat_history = []
+                        st.success("✅ Post analizado correctamente")
+                        st.balloons()
+                else:
+                    st.error("URL no válida")
+            else:
+                st.warning("Ingresa una URL")
+        
+        # Mostrar resultados
+        if st.session_state.current_analysis:
+            st.markdown("---")
+            st.subheader("📊 Resultado del Análisis")
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.info(f"**{st.session_state.current_post['title']}**")
+                st.caption(f"r/{st.session_state.current_post['subreddit']} • {st.session_state.current_post['score']} votos")
+            with col2:
                 txt_content = generate_txt_export(
                     st.session_state.current_post,
                     st.session_state.current_analysis,
                     st.session_state.chat_history
                 )
                 st.download_button(
-                    label="📥 Descargar análisis (TXT)",
+                    label="📥 Descargar",
                     data=txt_content,
-                    file_name=f"reddit_{st.session_state.current_post_id}_{datetime.now().strftime('%Y%m%d')}.txt",
-                    mime="text/plain"
+                    file_name=f"reddit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain",
+                    use_container_width=True
                 )
-        
-        # Opción 2: Entrada manual
-        st.markdown("---")
-        st.subheader("Opción 2: Entrada manual (si la automática falla)")
-        
-        with st.expander("📝 Pegar contenido manualmente"):
-            manual_title = st.text_input("Título del post:")
-            manual_subreddit = st.text_input("Subreddit (ej: AskReddit):")
-            manual_content = st.text_area(
-                "Contenido del post (incluye comentarios si quieres):",
-                height=300,
-                help="Copia y pega el contenido completo del post aquí"
-            )
             
-            if st.button("🔍 Analizar contenido manual"):
+            st.markdown(st.session_state.current_analysis)
+        
+        # Opción manual
+        st.markdown("---")
+        with st.expander("✍️ Entrada Manual (si la automática falla)"):
+            st.markdown("""
+            **Cómo usar:**
+            1. Abre el post en Reddit
+            2. Copia el título y contenido (incluye comentarios si quieres)
+            3. Pégalo aquí abajo
+            """)
+            
+            manual_title = st.text_input("Título del post:")
+            manual_subreddit = st.text_input("Subreddit:", placeholder="AskReddit")
+            manual_content = st.text_area("Contenido completo:", height=300)
+            
+            if st.button("📝 Analizar Contenido Manual", use_container_width=True):
                 if manual_title and manual_content:
-                    # Crear estructura de post manual
                     post = {
                         'title': manual_title,
                         'content': manual_content,
@@ -355,51 +349,52 @@ with tab1:
                     analysis = analyze_post(client, manual_content, analysis_prompt)
                     st.session_state.current_post = post
                     st.session_state.current_analysis = analysis
-                    st.session_state.current_post_id = "manual_" + datetime.now().strftime('%Y%m%d%H%M%S')
+                    st.session_state.current_post_id = f"manual_{datetime.now().strftime('%Y%m%d%H%M%S')}"
                     st.session_state.chat_history = []
-                    st.success("✅ Contenido analizado correctamente")
+                    st.success("✅ Contenido analizado")
+                    st.rerun()
                 else:
-                    st.warning("Por favor, completa al menos el título y contenido")
+                    st.warning("Completa título y contenido")
 
 with tab2:
-    st.header("Chat sobre el Post")
+    st.header("💬 Chat sobre el Post")
     
     if not api_key:
-        st.info("👆 Primero ingresa tu API Key en la barra lateral")
+        st.info("👆 Primero ingresa tu API Key")
     elif not st.session_state.current_post_id:
-        st.info("📝 Primero analiza un post en la pestaña anterior")
+        st.info("📝 Primero analiza un post")
     else:
-        st.subheader(f"💬 {st.session_state.current_post['title']}")
+        # Título del post actual
+        st.markdown(f"### {st.session_state.current_post['title']}")
+        st.caption(f"r/{st.session_state.current_post['subreddit']}")
         
-        # Mostrar historial de chat
-        for msg in st.session_state.chat_history:
-            if "user" in msg:
-                with st.chat_message("user"):
-                    st.write(msg['user'])
-            elif "assistant" in msg:
-                with st.chat_message("assistant"):
-                    st.write(msg['assistant'])
+        # Chat container
+        chat_container = st.container()
+        with chat_container:
+            for msg in st.session_state.chat_history:
+                if "user" in msg:
+                    with st.chat_message("user"):
+                        st.write(msg['user'])
+                elif "assistant" in msg:
+                    with st.chat_message("assistant"):
+                        st.write(msg['assistant'])
         
-        # Input de chat
-        user_input = st.chat_input("Escribe tu pregunta sobre el post...")
+        # Input
+        user_input = st.chat_input("Pregunta sobre el post...")
         
         if user_input:
-            # Agregar mensaje del usuario
             st.session_state.chat_history.append({"user": user_input})
             
-            # Generar respuesta
             with st.spinner("Pensando..."):
                 try:
                     prompt = f"""
-Contexto del post:
-{st.session_state.current_post['content']}
+Contexto: {st.session_state.current_post['content']}
 
-Análisis previo:
-{st.session_state.current_analysis}
+Análisis previo: {st.session_state.current_analysis}
 
-Pregunta del usuario: {user_input}
+Pregunta: {user_input}
 
-Responde basándote únicamente en la información del post.
+Responde basándote solo en la información disponible.
 """
                     response = client.chat.completions.create(
                         model="gpt-4o-mini",
@@ -413,13 +408,12 @@ Responde basándote únicamente en la información del post.
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
         
-        # Botones de control
+        # Controles
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🔄 Limpiar chat"):
+            if st.button("🔄 Limpiar chat", use_container_width=True):
                 st.session_state.chat_history = []
                 st.rerun()
-        
         with col2:
             if st.session_state.chat_history:
                 txt_content = generate_txt_export(
@@ -428,21 +422,13 @@ Responde basándote únicamente en la información del post.
                     st.session_state.chat_history
                 )
                 st.download_button(
-                    label="📥 Descargar conversación completa",
+                    label="📥 Descargar todo",
                     data=txt_content,
-                    file_name=f"reddit_chat_{st.session_state.current_post_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain"
+                    file_name=f"reddit_completo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain",
+                    use_container_width=True
                 )
 
 # Footer
 st.markdown("---")
-st.markdown("""
-<div style='text-align: center'>
-    <p>🔗 <a href='https://github.com/tu-usuario/reddit-analyzer'>GitHub</a> | 
-    ⚡ Powered by OpenAI GPT-4 | 
-    🚀 Built with Streamlit</p>
-    <p style='font-size: 0.8em; color: gray;'>
-    Si Reddit bloquea el acceso, usa la opción manual o ejecuta localmente
-    </p>
-</div>
-""", unsafe_allow_html=True)
+st.caption("🚀 Powered by OpenAI GPT-4 Mini | [GitHub](https://github.com/tu-usuario/reddit-analyzer)")
